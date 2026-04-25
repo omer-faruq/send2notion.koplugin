@@ -151,19 +151,14 @@ end
 -- Actual send
 -- ---------------------------------------------------------------------------
 
-local function dispatchToTarget(target, blocks, subpage_title)
-    local mode = target.mode or "append"
-    if mode == "subpage" then
-        return Api.createSubpage(target.token, target.page_id, subpage_title, blocks)
-    end
-    return Api.appendBlocks(target.token, target.page_id, blocks)
-end
-
--- Fire-and-wait HTTP send, optionally deferred until the device is online.
--- Errors and successes are reported through UIManager notifications so the
--- user always gets feedback regardless of the code path taken.
+-- Fire-and-wait HTTP send when online. When offline, the assembled blocks
+-- are persisted to the plugin's pending-queue so they can be flushed by
+-- `Send2Notion:drainQueue()` on the next NetworkConnected event. Whether
+-- the plugin actively tries to bring the network up is gated by the
+-- `auto_connect_when_offline` user setting (default off) so reading is
+-- not interrupted by a Wi-Fi prompt the user did not ask for.
 local function sendToActiveTarget(plugin, note_text, highlighted_text)
-    local target, label = plugin:getActiveTarget()
+    local target, label, target_id = plugin:getActiveTarget()
     if not target then
         UIManager:show(InfoMessage:new{
             icon = "notice-warning",
@@ -193,18 +188,37 @@ local function sendToActiveTarget(plugin, note_text, highlighted_text)
     local blocks = buildBlocks(plugin, note_text, highlighted_text, ctx)
     local subpage_title = formatSubpageTitle(target.subpage_title, ctx, note_text)
 
-    local perform = function()
+    local queue_item = {
+        target_id = target_id,
+        blocks = blocks,
+        subpage_title = subpage_title,
+        created_at = os.time(),
+    }
+
+    if NetworkMgr:isOnline() then
         Trapper:wrap(function()
             local trap = InfoMessage:new{
                 text = T(_("Sending note to %1…"), label),
                 timeout = nil,
             }
             UIManager:show(trap)
-            local ok, err = dispatchToTarget(target, blocks, subpage_title)
+            local ok, err, transient = plugin:dispatchQueueItem(queue_item)
             UIManager:close(trap)
             if ok then
                 UIManager:show(Notification:new{
                     text = T(_("Sent to %1"), label),
+                })
+                return
+            end
+            -- A transient transport error (lost Wi-Fi mid-request, DNS
+            -- glitch, ...) is queued so the user does not have to retype
+            -- the note. Permanent errors (auth, invalid page id, ...) are
+            -- shown immediately because they will not be fixed by a retry.
+            if transient then
+                plugin:enqueuePending(queue_item)
+                UIManager:show(Notification:new{
+                    text = T(_("Network glitch — queued for retry (%1 pending)."),
+                        plugin:countPending()),
                 })
             else
                 UIManager:show(InfoMessage:new{
@@ -214,17 +228,26 @@ local function sendToActiveTarget(plugin, note_text, highlighted_text)
                 })
             end
         end)
-    end
-
-    if NetworkMgr:isOnline() then
-        perform()
         return
     end
 
-    UIManager:show(Notification:new{
-        text = _("Offline — the note will be sent once online."),
-    })
-    NetworkMgr:runWhenOnline(perform)
+    -- Offline: always queue, then optionally try to bring Wi-Fi up.
+    plugin:enqueuePending(queue_item)
+    local pending = plugin:countPending()
+    local auto_connect = plugin:readSetting("auto_connect_when_offline", false)
+    if auto_connect then
+        UIManager:show(Notification:new{
+            text = T(_("Offline — queued (%1 pending). Trying to connect…"), pending),
+        })
+        -- Empty callback: actual draining happens via onNetworkConnected
+        -- once the connection is established. This avoids running the
+        -- send twice (here and from the NetworkConnected event).
+        NetworkMgr:runWhenOnline(function() end)
+    else
+        UIManager:show(Notification:new{
+            text = T(_("Offline — queued (%1 pending). Will send when you reconnect."), pending),
+        })
+    end
 end
 
 -- Compute the dialog title. When the user defined a `name` for the

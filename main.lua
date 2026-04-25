@@ -14,11 +14,15 @@ local DataStorage = require("datastorage")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LuaSettings = require("luasettings")
+local Notification = require("ui/widget/notification")
+local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local lfs = require("libs/libkoreader-lfs")
 local _ = require("gettext")
+local T = require("ffi/util").template
 
+local Api = require("send2notion_api")
 local NoteDialog = require("send2notion_note_dialog")
 local SettingsModule = require("send2notion_settings")
 
@@ -91,7 +95,14 @@ function Send2Notion:resetRememberedSettings()
     if not self.settings then
         self.settings = LuaSettings:open(SETTINGS_FILE)
     end
+    -- Preserve the pending-queue across a settings reset: discarding
+    -- queued notes silently would lose user content. The dedicated
+    -- "Discard pending notes" entry is the only way to clear the queue.
+    local preserved_queue = self:loadPendingQueue()
     self.settings:reset({})
+    if #preserved_queue > 0 then
+        self.settings:saveSetting("pending_queue", preserved_queue)
+    end
     self.settings:flush()
     self:refreshHighlightButton()
 end
@@ -165,15 +176,18 @@ function Send2Notion:setActiveTargetId(target_id)
     self:saveSetting("active_target_id", target_id)
 end
 
--- Returns the active target config and its display label. Both are `nil`
--- when the plugin is not configured at all.
+-- Returns the active target config, its display label, and its id.
+-- All three are `nil` when the plugin is not configured at all. The id
+-- is needed by the pending-queue so a queued item can be re-resolved
+-- against the current configuration at drain time without storing the
+-- integration token in the queue file.
 function Send2Notion:getActiveTarget()
     local id = self:getActiveTargetId()
-    if not id or not self.CONFIGURATION then return nil, nil end
+    if not id or not self.CONFIGURATION then return nil, nil, nil end
     local target = self.CONFIGURATION.targets and self.CONFIGURATION.targets[id]
-    if type(target) ~= "table" then return nil, nil end
+    if type(target) ~= "table" then return nil, nil, nil end
     local label = (type(target.name) == "string" and target.name ~= "") and target.name or id
-    return target, label
+    return target, label, id
 end
 
 -- ---------------------------------------------------------------------------
@@ -305,6 +319,157 @@ function Send2Notion:onSend2NotionOpenNote()
 end
 
 -- ---------------------------------------------------------------------------
+-- Pending queue (offline send buffer)
+-- ---------------------------------------------------------------------------
+--
+-- When the device is offline at send time, the assembled blocks are
+-- persisted to LuaSettings under `pending_queue` as an array of items.
+-- The queue is drained in FIFO order whenever the plugin observes a
+-- successful network connection (`onNetworkConnected`) or once at load
+-- time if the device happens to already be online.
+--
+-- A pending item carries only the data needed to resend later: target id,
+-- the prebuilt block list, and (for sub-page mode) the rendered title.
+-- The Notion integration token and page id are resolved from the current
+-- configuration at drain time so secrets never live in the queue file.
+
+function Send2Notion:loadPendingQueue()
+    local q = self:readSetting("pending_queue", nil)
+    if type(q) ~= "table" then return {} end
+    return q
+end
+
+function Send2Notion:savePendingQueue(queue)
+    self:saveSetting("pending_queue", queue or {})
+end
+
+function Send2Notion:enqueuePending(item)
+    if type(item) ~= "table" then return end
+    local queue = self:loadPendingQueue()
+    table.insert(queue, item)
+    self:savePendingQueue(queue)
+end
+
+function Send2Notion:countPending()
+    return #self:loadPendingQueue()
+end
+
+function Send2Notion:clearPendingQueue()
+    self:savePendingQueue({})
+end
+
+-- Resolve a queue item back to a Notion API call. Returns ok, err.
+-- Errors classified as transient (network/timeout) are signalled via the
+-- third return value `transient = true` so the caller can keep the item.
+function Send2Notion:dispatchQueueItem(item)
+    if type(item) ~= "table" or not item.target_id then
+        return false, "Invalid queue item", false
+    end
+    if not self.CONFIGURATION or type(self.CONFIGURATION.targets) ~= "table" then
+        return false, "Configuration is missing", false
+    end
+    local target = self.CONFIGURATION.targets[item.target_id]
+    if type(target) ~= "table" then
+        return false, T(_("Target '%1' no longer exists in configuration"), item.target_id), false
+    end
+    if not target.token or target.token == "" then
+        return false, "Missing Notion integration token", false
+    end
+    if not Api.normalizePageId(target.page_id) then
+        return false, "Invalid Notion page id in configuration", false
+    end
+    if type(item.blocks) ~= "table" or #item.blocks == 0 then
+        return false, "Empty block list", false
+    end
+
+    local mode = target.mode or "append"
+    local ok, err
+    if mode == "subpage" then
+        ok, err = Api.createSubpage(target.token, target.page_id,
+            item.subpage_title or _("Note"), item.blocks)
+    else
+        ok, err = Api.appendBlocks(target.token, target.page_id, item.blocks)
+    end
+    if ok then return true, nil, false end
+
+    -- Heuristic: anything that looks like a transport problem should keep
+    -- the item on the queue so it can be retried later.
+    local err_text = tostring(err or "")
+    local transient = err_text:find("Network error", 1, true)
+        or err_text:find("timed out", 1, true)
+        or err_text:find("Request timed out", 1, true)
+    return false, err_text ~= "" and err_text or "Unknown error", transient and true or false
+end
+
+-- Walk the queue once, sending each item in order. Items that succeed are
+-- removed; items that fail with a transient error (or while we lose
+-- connectivity mid-drain) stay in the queue. Items that fail with a
+-- permanent error are dropped and reported.
+function Send2Notion:drainQueue(opts)
+    opts = opts or {}
+    if self._draining then return end
+    local NetworkMgr = require("ui/network/manager")
+    if not NetworkMgr:isOnline() then return end
+    local queue = self:loadPendingQueue()
+    if #queue == 0 then return end
+
+    self._draining = true
+    Trapper:wrap(function()
+        local sent, dropped = 0, 0
+        local last_err
+        local remaining = {}
+        local stopped_for_network = false
+        for _, item in ipairs(queue) do
+            if stopped_for_network then
+                table.insert(remaining, item)
+            else
+                local ok, err, transient = self:dispatchQueueItem(item)
+                if ok then
+                    sent = sent + 1
+                else
+                    last_err = err
+                    if transient or not NetworkMgr:isOnline() then
+                        stopped_for_network = true
+                        table.insert(remaining, item)
+                    else
+                        dropped = dropped + 1
+                        logger.warn("send2notion: dropped queued item:", err)
+                    end
+                end
+            end
+        end
+        self:savePendingQueue(remaining)
+        self._draining = false
+
+        if opts.silent then return end
+        if sent == 0 and dropped == 0 then return end
+
+        local parts = {}
+        if sent > 0 then
+            table.insert(parts, T(_("Sent %1 pending note(s) to Notion."), sent))
+        end
+        if dropped > 0 then
+            table.insert(parts, T(_("Dropped %1 (last error: %2)."),
+                dropped, last_err or _("unknown")))
+        end
+        if #remaining > 0 then
+            table.insert(parts, T(_("%1 still pending."), #remaining))
+        end
+        UIManager:show(Notification:new{ text = table.concat(parts, " ") })
+    end)
+end
+
+-- Schedule a drain shortly after the network comes up. The short delay
+-- gives the OS a moment to settle DNS so `isOnline` (a name-resolution
+-- check inside KOReader) consistently returns true.
+function Send2Notion:onNetworkConnected()
+    if self:countPending() == 0 then return end
+    UIManager:scheduleIn(1, function()
+        self:drainQueue()
+    end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
@@ -321,6 +486,15 @@ end
 
 function Send2Notion:onReaderReady()
     self:refreshHighlightButton()
+    -- Catch the case where the device was already online when the plugin
+    -- loaded (so the global NetworkConnected event fired before we
+    -- registered our handler) and there are leftover pending items.
+    if self:countPending() > 0 then
+        local NetworkMgr = require("ui/network/manager")
+        if NetworkMgr:isOnline() then
+            UIManager:scheduleIn(2, function() self:drainQueue() end)
+        end
+    end
 end
 
 return Send2Notion
